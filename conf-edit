@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0
+# Manipulate options in a .config file from the command line
+
+myname=${0##*/}
+
+# If no prefix forced, use the default CONFIG_
+CONFIG_="${CONFIG_-CONFIG_}"
+
+# We use an uncommon delimiter for sed substitutions
+SED_DELIM=$(echo -en "\001")
+
+usage() {
+	cat >&2 <<EOL
+Manipulate options in a .config file from the command line.
+Usage:
+$myname options command ...
+commands:
+	--enable|-e option   Enable option
+	--disable|-d option  Disable option
+	--module|-m option   Turn option into a module
+	--set-str option string
+	                     Set option to "string"
+	--set-val option value
+	                     Set option to value
+	--undefine|-u option Undefine option
+	--state|-s option    Print state of option (n,y,m,undef)
+
+	--enable-after|-E beforeopt option
+                             Enable option directly after other option
+	--disable-after|-D beforeopt option
+                             Disable option directly after other option
+	--module-after|-M beforeopt option
+                             Turn option into module directly after other option
+
+	commands can be repeated multiple times
+
+options:
+	--file config-file   .config file to change (default .config)
+	--keep-case|-k       Keep next symbols' case (dont' upper-case it)
+
+$myname doesn't check the validity of the .config file. This is done at next
+make time.
+
+By default, $myname will upper-case the given symbol. Use --keep-case to keep
+the case of all following symbols unchanged.
+
+$myname uses 'CONFIG_' as the default symbol prefix. Set the environment
+variable CONFIG_ to the prefix to use. Eg.: CONFIG_="FOO_" $myname ...
+EOL
+	exit 1
+}
+
+debugmsg() {
+	echo >&2 "$(tput dim):: $*$(tput sgr0)"
+}
+
+resetarg() {
+	NAME=""
+	VAL=""
+	ARG=""
+}
+
+getsafeval() {
+	V="$1"
+	V="${V/#\"/}"
+	V="${V/%\"/}"
+	V="${V//\\\"/\"}"
+	echo -n "${V}"
+}
+
+getbool() {
+	V="$1"
+	L="$2"
+	SV=$(getsafeval "$V" | tr 'A-Z' 'a-z')
+	case "$SV" in
+		y|yes) test [ "$L" = "long" ] && SV="yes" || SV="y" ;;
+		t|true) test [ "$L" = "long" ] && SV="true" || SV="t"  ;;
+		n|no)  test [ "$L" = "long" ] && SV="no" || SV="n" ; ;;
+		f|false)  test [ "$L" = "long" ] && SV="false" || SV="f" ;;
+		*) $SV="undef"
+	esac
+	echo -n "${SV}"
+}
+
+is_true() {
+	V=$(tr 'A-Z' 'a-z')
+	case "$SV" in
+		y|yes|t|true) echo -n 'true'; return 0 ;;
+		*) 			  return 1 ;;
+	esac
+	return 1
+}
+
+is_false() {
+	V=$(tr 'A-Z' 'a-z')
+	case "$SV" in
+		n|no|f|false) echo -n 'false'; return 0 ;;
+		*) 			  return 1 ;;
+	esac
+	return 1
+}
+
+is_true_false() {
+	V=$(tr 'A-Z' 'a-z')
+	case "$SV" in
+		y|yes|t|true) echo -n 'yes'; return 0 ;;
+		n|no|f|false) echo -n 'false'; return 0 ;;
+		*) 			  return 1 ;;
+	esac
+	return 1
+}
+
+checkarg() {
+	ARG="$1"
+	if [ "$ARG" = "" ] ; then
+		usage
+	fi
+	case "$ARG" in
+	${CONFIG_}*)
+		ARG="${ARG/${CONFIG_}/}"
+		;;
+	esac
+	if [ "$MUNGE_CASE" = "yes" ] ; then
+		ARG="`echo $ARG | tr a-z A-Z`"
+	fi
+	if [[ $ARG =~ "=" ]]; then
+	   NAME="${ARG%%=*}"
+	   VAL="${ARG##*=}"
+	   ARG="$NAME"
+	fi
+}
+
+checkargval() {
+	checkarg "$@"
+	if [[ $ARG =~ "=" ]]; then
+	   NAME="${ARG%%=*}"
+	   VAL="${ARG##*=}"
+	   ARG="$NAME"
+	fi
+}
+
+
+txt_append() {
+	local anchor="$1"
+	local insert="$2"
+	local infile="$3"
+	local tmpfile="$infile.swp"
+
+	# sed append cmd: 'a\' + newline + text + newline
+	cmd="$(printf "a\\%b$insert" "\n")"
+
+	sed -e "/$anchor/$cmd" "$infile" >"$tmpfile"
+	# replace original file with the edited one
+	mv "$tmpfile" "$infile"
+}
+
+txt_subst() {
+	local before="$1"
+	local after="$2"
+	local infile="$3"
+	local tmpfile="$infile.swp"
+
+	sed -e "s$SED_DELIM$before$SED_DELIM$after$SED_DELIM" "$infile" >"$tmpfile"
+	# replace original file with the edited one
+	mv "$tmpfile" "$infile"
+}
+
+txt_delete() {
+	local text="$1"
+	local infile="$2"
+	local tmpfile="$infile.swp"
+
+	sed -e "/$text/d" "$infile" >"$tmpfile"
+	# replace original file with the edited one
+	mv "$tmpfile" "$infile"
+}
+
+set_var() {
+	local name=$1 new=$2 before=$3
+
+	name_re="^($name=|# $name is not set)"
+	before_re="^($before=|# $before is not set)"
+	if test -n "$before" && grep -Eq "$before_re" "$FN"; then
+		txt_append "^$before=" "$new" "$FN"
+		txt_append "^# $before is not set" "$new" "$FN"
+	elif grep -Eq "$name_re" "$FN"; then
+		txt_subst "^$name=.*" "$new" "$FN"
+		txt_subst "^# $name is not set" "$new" "$FN"
+	else
+		echo "$new" >>"$FN"
+	fi
+}
+
+undef_var() {
+	local name=$1
+
+	txt_delete "^$name=" "$FN"
+	txt_delete "^# $name is not set" "$FN"
+}
+
+FN=.config
+MUNGE_CASE=yes
+
+VALID_ARGS=$(\
+	getopt \
+		-o e:d:m:f:s:u:E:D:M:k \
+		--long enable:,disable:,module:,file:,set-str:,set-val:,state:,undefine:,enable-after:,disable-after:,module-after:,refresh,keep-case \
+		-- "$@"\
+	);
+
+if [[ $? -ne 0 ]]; then
+    exit 1;
+fi
+
+eval set -- "$VALID_ARGS"
+while [ : ]; do
+  case "$1" in
+    -e | --enable)
+        debugmsg "Processing 'enable' option. Input argument is '$2'"
+        resetarg
+        checkarg "$2" # ARG=$2
+        set_var "${CONFIG_}$ARG" "${CONFIG_}$ARG=y"
+        shift 2
+        ;;
+    -d | --disable)
+        debugmsg "Processing 'disable' option. Input argument is '$2'"
+        resetarg
+        checkarg "$2" # ARG=$2
+        set_var "${CONFIG_}$ARG" "# ${CONFIG_}$ARG is not set"
+        shift 2
+        ;;
+    -m | --module)
+        debugmsg "Processing 'module' option. Input argument is '$2'"
+        resetarg
+        checkarg "$2" # ARG=$2
+        set_var "${CONFIG_}$ARG" "${CONFIG_}$ARG=m"
+        shift 2
+        ;;
+    -f | --file)
+        debugmsg "Processing 'file' option. Input argument is '$2'"
+        FN=$2
+        shift 2
+        ;;
+    --set-str)
+		debugmsg "Processing 'set-str' option. Input argument is '$2' and '$3'"
+		# sed swallows one level of escaping, so we need double-escaping
+		resetarg
+		checkargval "$2" # ARG= VAL=
+		#VAL=$3
+		debugmsg "VAL=$VAL"
+		set_var "${CONFIG_}$ARG" "${CONFIG_}$ARG=\"${VAL//\"/\\\\\"}\""
+		shift 2
+		;;
+
+	--set-val)
+		debugmsg "Processing 'set-val' option. Input argument is '$2' and '$3'"
+		resetarg
+		checkargval "$2" # # ARG= VAL=
+		debugmsg "VAL=$VAL"
+		set_var "${CONFIG_}$ARG" "${CONFIG_}$ARG=$VAL"
+		shift 2
+		;;
+	-s | --state)
+		debugmsg "Processing 'state' option. Input argument is '$2'"
+		resetarg
+		checkarg "$2" # ARG=$2
+		if grep -q "# ${CONFIG_}$ARG is not set" $FN ; then
+			echo n
+		else
+			V="$(grep "^${CONFIG_}$ARG=" $FN)"
+			if [ $? != 0 ] ; then
+				echo undef
+			else
+				V="${V/#${CONFIG_}$ARG=/}"
+				V="${V/#\"/}"
+				V="${V/%\"/}"
+				V="${V//\\\"/\"}"
+				echo "${V}"
+			fi
+		fi
+		shift 2
+		;;
+
+	-u | --undefine)
+		debugmsg "Processing 'undefine' option. Input argument is '$2'"
+		resetarg
+		checkarg "$2" # ARG=$2
+		undef_var "${CONFIG_}$ARG"
+		shift 2
+		;;
+	-E | --enable-after)
+		debugmsg "Processing 'enable-after' option. Input argument is '$2' and '$3'"
+		resetarg
+		checkarg "$2" # ARG=$2
+		A=$ARG
+		checkarg "$4" # ARG=$3
+		B=$ARG
+		debugmsg "A=$A B=$B VAL=$VAL"
+		set_var "${CONFIG_}$B" "${CONFIG_}$B=y" "${CONFIG_}$A"
+		shift 2		
+		;;
+
+	-D | --disable-after)
+		debugmsg "Processing 'disable-after' option. Input argument is '$2' and '$3'"
+		resetarg
+		checkarg "$2" # ARG=$2
+		A=$ARG
+		checkarg "$4" # ARG=$3
+		B=$ARG
+		debugmsg "A=$A B=$B VAL=$VAL"
+		set_var "${CONFIG_}$B" "# ${CONFIG_}$B is not set" "${CONFIG_}$A"
+		shift 2
+		;;
+
+	-M | --module-after)
+		debugmsg "Processing 'module-after' option. Input argument is '$2' and '$3'"
+		resetarg
+		checkarg "$2" # ARG=$2
+		A=$ARG
+		checkarg "$4" # ARG=$3
+		B=$ARG
+		debugmsg "A=$A B=$B VAL=$VAL"
+		set_var "${CONFIG_}$B" "${CONFIG_}$B=m" "${CONFIG_}$A"
+		shift 2	
+		;;
+
+	# undocumented because it ignores --file (fixme)
+	--refresh)
+		debugmsg "Processing 'refresh' option."
+		yes "" | make oldconfig
+		shift 1
+		;;
+	--keep-case|-k)
+		debugmsg "Processing 'keep-case' option."
+		MUNGE_CASE=no
+		shift
+		continue
+		;;
+    --) shift; 
+        break 
+        ;;
+  	#*) shift; 
+  	#    echo "bad command: $CMD" >&2
+		# usage
+		# break
+		# ;;
+  esac
+done
+
+exit 0
+
+if [ "$1" = "--file" ]; then
+	FN="$2"
+	if [ "$FN" = "" ] ; then
+		usage
+	fi
+	shift 2
+# elif [[ "${1%%=*}" = "--file" ]] && [[ "${1##*=}" != "--file" ]]; then
+# 	FN="${1##*=}"
+# 	shift 1
+else
+	FN=.config
+fi
+
+if [ "$1" = "" ] ; then
+	usage
+fi
+
+MUNGE_CASE=yes
+while [ "$1" != "" ] ; do
+	CMD="$1"
+	shift
+	case "$CMD" in
+	--keep-case|-k)
+		MUNGE_CASE=no
+		continue
+		;;
+	--refresh)
+		;;
+	--*-after|-E|-D|-M)
+		checkarg "$1"
+		A=$ARG
+		checkarg "$2"
+		B=$ARG
+		shift 2
+		;;
+	-*)
+		checkarg "$1"
+		shift
+		;;
+	esac
+	case "$CMD" in
+	--enable|-e)
+		set_var "${CONFIG_}$ARG" "${CONFIG_}$ARG=y"
+		;;
+
+	--disable|-d)
+		set_var "${CONFIG_}$ARG" "# ${CONFIG_}$ARG is not set"
+		;;
+
+	--module|-m)
+		set_var "${CONFIG_}$ARG" "${CONFIG_}$ARG=m"
+		;;
+
+	--set-str)
+		# sed swallows one level of escaping, so we need double-escaping
+		set_var "${CONFIG_}$ARG" "${CONFIG_}$ARG=\"${1//\"/\\\\\"}\""
+		shift
+		;;
+
+	--set-val)
+		set_var "${CONFIG_}$ARG" "${CONFIG_}$ARG=$1"
+		shift
+		;;
+	--undefine|-u)
+		undef_var "${CONFIG_}$ARG"
+		;;
+
+	--state|-s)
+		if grep -q "# ${CONFIG_}$ARG is not set" $FN ; then
+			echo n
+		else
+			V="$(grep "^${CONFIG_}$ARG=" $FN)"
+			if [ $? != 0 ] ; then
+				echo undef
+			else
+				V="${V/#${CONFIG_}$ARG=/}"
+				V="${V/#\"/}"
+				V="${V/%\"/}"
+				V="${V//\\\"/\"}"
+				echo "${V}"
+			fi
+		fi
+		;;
+
+	--enable-after|-E)
+		set_var "${CONFIG_}$B" "${CONFIG_}$B=y" "${CONFIG_}$A"
+		;;
+
+	--disable-after|-D)
+		set_var "${CONFIG_}$B" "# ${CONFIG_}$B is not set" "${CONFIG_}$A"
+		;;
+
+	--module-after|-M)
+		set_var "${CONFIG_}$B" "${CONFIG_}$B=m" "${CONFIG_}$A"
+		;;
+
+	# undocumented because it ignores --file (fixme)
+	--refresh)
+		yes "" | make oldconfig
+		;;
+
+	*)
+		echo "bad command: $CMD" >&2
+		usage
+		;;
+	esac
+done
