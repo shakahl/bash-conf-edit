@@ -10,6 +10,16 @@ CONFIG_="${CONFIG_-CONFIG_}"
 # We use an uncommon delimiter for sed substitutions
 SED_DELIM=$(echo -en "\001")
 
+declare -r V_UNDEF="undef"
+declare -r V_YES="y"
+declare -r V_YES_LONG="yes"
+declare -r V_NO="n"
+declare -r V_NO_LONG="no"
+declare -r V_TRUE="true"
+declare -r V_FALSE="false"
+declare -r V_MODULE="m"
+
+
 usage() {
 	cat >&2 <<EOL
 Manipulate options in a .config file from the command line.
@@ -52,7 +62,7 @@ EOL
 }
 
 debugmsg() {
-	echo >&2 "$(tput dim):: $*$(tput sgr0)"
+	echo >&2 "$(tput dim): DEBUG: $*$(tput sgr0)"
 }
 
 resetarg() {
@@ -62,6 +72,7 @@ resetarg() {
 }
 
 getsafeval() {
+	local V=
 	V="$1"
 	V="${V/#\"/}"
 	V="${V/%\"/}"
@@ -70,48 +81,94 @@ getsafeval() {
 }
 
 getbool() {
-	V="$1"
-	L="$2"
-	SV=$(getsafeval "$V" | tr 'A-Z' 'a-z')
-	case "$SV" in
-		y|yes) test [ "$L" = "long" ] && SV="yes" || SV="y" ;;
-		t|true) test [ "$L" = "long" ] && SV="true" || SV="t"  ;;
-		n|no)  test [ "$L" = "long" ] && SV="no" || SV="n" ; ;;
-		f|false)  test [ "$L" = "long" ] && SV="false" || SV="f" ;;
-		*) $SV="undef"
+	local cmd=
+	local v=
+	local opt_long=
+	local opt_yesno=
+	local inputv=
+	local SV=
+
+	inputv="$1"
+
+
+	while [ "$1" != "" ] ; do
+		cmd="$1"
+		shift
+		case "$cmd" in
+			-l|--long) opt_long="y" ; break ;;
+		esac
+	done
+
+	tmpv=$(getsafeval "$inputv" | tr 'A-Z' 'a-z')
+
+	if [ "$tmpv" = "" ]; then
+		echo ""
+		return
+	fi
+
+	case "$tmpv" in
+		y|yes)
+				test [ "$opt_long" = "$V_YES" ] && tmpv="$V_YES_LONG" || tmpv="$V_YES" ;;
+		n|no)
+				test [ "$opt_long" = "$V_YES" ] && tmpv="$V_NO_LONG"  || tmpv="$V_NO" ;;
+		true|"1")
+				test [ "$opt_long" = "$V_YES" ] && tmpv="$V_TRUE"     || tmpv="1" ;;
+		false|"0")
+				test [ "$opt_long" = "$V_YES" ] && tmpv="$V_FALSE"    || tmpv="0" ;;
+		*) tmpv="${V_UNDEF:-undef}"
 	esac
-	echo -n "${SV}"
+
+	echo -n "${tmpv}"
 }
 
-is_true() {
-	V=$(tr 'A-Z' 'a-z')
-	case "$SV" in
-		y|yes|t|true) echo -n 'true'; return 0 ;;
-		*) 			  return 1 ;;
+is_undef() {
+	local inputv=
+	inputv=$(getsafeval "$1")
+	case "$1" in
+		"$V_UNDEF") true ;;
 	esac
-	return 1
+	false
 }
 
-is_false() {
-	V=$(tr 'A-Z' 'a-z')
-	case "$SV" in
-		n|no|f|false) echo -n 'false'; return 0 ;;
-		*) 			  return 1 ;;
-	esac
-	return 1
+is_emptyval() {
+	local inputv=
+	inputv=$(getsafeval "$1")
+	if [ "$inputv" = "" ]; then
+		true
+	fi
+	false
 }
 
-is_true_false() {
-	V=$(tr 'A-Z' 'a-z')
-	case "$SV" in
-		y|yes|t|true) echo -n 'yes'; return 0 ;;
-		n|no|f|false) echo -n 'false'; return 0 ;;
-		*) 			  return 1 ;;
+is_trueval() {
+	local inputv=
+	inputv=$(getbool "$1" | tr 'A-Z' 'a-z')
+	case "$inputv" in
+		"$V_YES"|"$V_YES_LONG"|"$V_TRUE"|y|yes|t|true|"1") true ;;
 	esac
-	return 1
+	false
+}
+
+is_falseval() {
+	local inputv=
+	inputv=$(getbool "$1" | tr 'A-Z' 'a-z')
+	case "$inputv" in
+		"$V_NO"|"$V_NO_LONG"|"$V_FALSE"|n|no|f|false|"0") true ;;
+	esac
+	false
+}
+
+truefalse() {
+	local inputv=
+	inputv=$(getbool "$1" | tr 'A-Z' 'a-z')
+	case "$inputv" in
+		"$V_YES"|"$V_YES_LONG"|"$V_TRUE"|y|yes|t|true|"1") true ;;
+		"$V_NO"|"$V_NO_LONG"|"$V_FALSE"|n|no|f|false|"0") true ;;
+	esac
+	echo -n "$V_UNDEF"
 }
 
 checkarg() {
+	local tmpname=
 	ARG="$1"
 	if [ "$ARG" = "" ] ; then
 		usage
@@ -125,9 +182,9 @@ checkarg() {
 		ARG="`echo $ARG | tr a-z A-Z`"
 	fi
 	if [[ $ARG =~ "=" ]]; then
-	   NAME="${ARG%%=*}"
+	   tmpname="${ARG%%=*}"
 	   VAL="${ARG##*=}"
-	   ARG="$NAME"
+	   ARG="$tmpname"
 	fi
 }
 
@@ -220,7 +277,7 @@ while [ : ]; do
         debugmsg "Processing 'enable' option. Input argument is '$2'"
         resetarg
         checkarg "$2" # ARG=$2
-        set_var "${CONFIG_}$ARG" "${CONFIG_}$ARG=y"
+        set_var "${CONFIG_}$ARG" "${CONFIG_}$ARG=${V_YES:-y}"
         shift 2
         ;;
     -d | --disable)
@@ -234,7 +291,7 @@ while [ : ]; do
         debugmsg "Processing 'module' option. Input argument is '$2'"
         resetarg
         checkarg "$2" # ARG=$2
-        set_var "${CONFIG_}$ARG" "${CONFIG_}$ARG=m"
+        set_var "${CONFIG_}$ARG" "${CONFIG_}$ARG=${V_MODULE:-m}"
         shift 2
         ;;
     -f | --file)
@@ -270,7 +327,7 @@ while [ : ]; do
 		else
 			V="$(grep "^${CONFIG_}$ARG=" $FN)"
 			if [ $? != 0 ] ; then
-				echo undef
+				echo "${V_UNDEF:-undef}"
 			else
 				V="${V/#${CONFIG_}$ARG=/}"
 				V="${V/#\"/}"
@@ -297,7 +354,7 @@ while [ : ]; do
 		checkarg "$4" # ARG=$3
 		B=$ARG
 		debugmsg "A=$A B=$B VAL=$VAL"
-		set_var "${CONFIG_}$B" "${CONFIG_}$B=y" "${CONFIG_}$A"
+		set_var "${CONFIG_}$B" "${CONFIG_}$B=${V_YES:-y}" "${CONFIG_}$A"
 		shift 2		
 		;;
 
@@ -321,7 +378,7 @@ while [ : ]; do
 		checkarg "$4" # ARG=$3
 		B=$ARG
 		debugmsg "A=$A B=$B VAL=$VAL"
-		set_var "${CONFIG_}$B" "${CONFIG_}$B=m" "${CONFIG_}$A"
+		set_var "${CONFIG_}$B" "${CONFIG_}$B=${V_MODULE:-m}" "${CONFIG_}$A"
 		shift 2	
 		;;
 
